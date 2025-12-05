@@ -7,6 +7,11 @@
 #include <getopt.h>
 #include <err.h>
 #include <assert.h>
+#include <string.h>
+#include <mpi.h>
+
+int size;          /* number of nodes */
+int rank;          /* node identifier */    
 
 typedef uint64_t u64;       /* portable 64-bit integer */
 typedef uint32_t u32;       /* portable 32-bit integer */
@@ -34,6 +39,7 @@ double wtime()
 }
 
 // murmur64 hash functions, tailorized for 64-bit ints / Cf. Daniel Lemire
+//hash key
 u64 murmur64(u64 x)
 {
     x ^= x >> 33;
@@ -304,11 +310,23 @@ void process_command_line_options(int argc, char ** argv)
 
 int main(int argc, char **argv)
 {
-	process_command_line_options(argc, argv);
-    printf("Running with n=%d, C0=(%08x, %08x) and C1=(%08x, %08x)\n", 
-        (int) n, C[0][0], C[0][1], C[1][0], C[1][1]);
 
-	dict_setup(1.125 * (1ull << n));
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    process_command_line_options(argc, argv);
+    if(rank == 0) {
+
+        printf("Running with n=%d, C0=(%08x, %08x) and C1=(%08x, %08x)\n", 
+        (int) n, C[0][0], C[0][1], C[1][0], C[1][1]);
+    }   
+
+    u64 total_dict_items = 1.125 * (1ull << n);
+    u64 local_dict_size = total_dict_items / size;
+    dict_setup(local_dict_size);
+
+	// dict_setup(1.125 * (1ull << n));
 
 	/* search */
 	u64 k1[16], k2[16];
@@ -321,4 +339,8 @@ int main(int argc, char **argv)
     	assert(is_good_pair(k1[i], k2[i]));		
 	    printf("Solution found: (%" PRIx64 ", %" PRIx64 ") [checked OK]\n", k1[i], k2[i]);
 	}
+
+    free(A);
+    MPI_Finalize();
+    return 0;
 }
