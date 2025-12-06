@@ -9,9 +9,11 @@
 #include <assert.h>
 #include <string.h>
 #include <mpi.h>
+#include <math.h>
 
-int size;          /* number of nodes */
-int rank;          /* node identifier */    
+double log2(double x) {
+    return log(x) / log(2);
+}
 
 typedef uint64_t u64;       /* portable 64-bit integer */
 typedef uint32_t u32;       /* portable 32-bit integer */
@@ -21,6 +23,7 @@ struct __attribute__ ((packed)) entry { u32 k; u64 v; };  /* hash table entry */
 
 u64 n = 0;         /* block size (in bits) */
 u64 mask;          /* this is 2**n - 1 */
+int nres = 0;
 
 u64 dict_size;     /* number of slots in the hash table */
 struct entry *A;   /* the hash table */
@@ -176,6 +179,17 @@ int dict_probe(u64 key, int maxval, u64 values[])
    	}
 }
 
+int dict_probe_local(u64 key, int maxval, u64 values[], int rank, int num_processes) {
+
+    int bit_number = log2(num_processes);
+    u64 mask = (1ULL << bit_number) - 1;
+
+    if ((key & mask) == rank) {
+        return dict_probe(key, maxval, values);
+    }
+    return 0;
+}
+
 /***************************** MITM problem ***********************************/
 
 /* f : {0, 1}^n --> {0, 1}^n.  Speck64-128 encryption of P[0], using k */
@@ -220,13 +234,37 @@ bool is_good_pair(u64 k1, u64 k2)
 /******************************************************************************/
 
 /* search the "golden collision" */
-int golden_claw_search(int maxres, u64 k1[], u64 k2[])
+int golden_claw_search_mpi(int maxres, u64 k1[], u64 k2[], int rank, int num_processes)
 {
     double start = wtime();
     u64 N = 1ull << n;
+    u64 local_dict_size = (1.125* N) / num_processes;
+
+    u64 max_processes = (1.125 * N) / 1024;
+
+    if (num_processes > max_processes) {
+        printf("The number of processes (%d) is more than n=%llu.\n", num_processes, n);
+        num_processes = max_processes;
+        local_dict_size = (1.125 * N);
+    }
+
+    dict_setup(local_dict_size);
+
+    struct entry *local_entries = malloc(sizeof(struct entry) * (local_dict_size));
+
+    if (!local_entries) {
+        printf("Cannot allocate memory for local_entries (process %d)\n", rank);
+        exit(0);
+    }
+    
+    int bit_numbers = log2(num_processes); // Number of bits for the mask
+    u64 mask = (1ULL << bit_numbers) - 1;
+
     for (u64 x = 0; x < N; x++) {
         u64 z = f(x);
-        dict_insert(z, x);
+        if ((x & mask) == rank) {
+            dict_insert(z, x);
+        }
     }
 
     double mid = wtime();
@@ -237,7 +275,7 @@ int golden_claw_search(int maxres, u64 k1[], u64 k2[])
     u64 x[256];
     for (u64 z = 0; z < N; z++) {
         u64 y = g(z);
-        int nx = dict_probe(y, 256, x);
+        int nx = dict_probe_local(y, 256, x, rank, num_processes);
         assert(nx >= 0);
         ncandidates += nx;
         for (int i = 0; i < nx; i++)
@@ -312,35 +350,39 @@ int main(int argc, char **argv)
 {
 
     MPI_Init(&argc, &argv);
+
+    int rank, num_processes;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_size(MPI_COMM_WORLD, &num_processes);
 
     process_command_line_options(argc, argv);
     if(rank == 0) {
-
-        printf("Running with n=%d, C0=(%08x, %08x) and C1=(%08x, %08x)\n", 
-        (int) n, C[0][0], C[0][1], C[1][0], C[1][1]);
+        printf("Running with n=%d, C0=(%08x, %08x) and C1=(%08x, %08x)\n",
+               (int) n, C[0][0], C[0][1], C[1][0], C[1][1]);
     }   
 
-    u64 total_dict_items = 1.125 * (1ull << n);
-    u64 local_dict_size = total_dict_items / size;
-    dict_setup(local_dict_size);
+   	u64 k1[16], k2[16];
+	int nkey = golden_claw_search_mpi(16, k1, k2, rank, num_processes);
 
-	// dict_setup(1.125 * (1ull << n));
+    int nkey_global = 0;
 
-	/* search */
-	u64 k1[16], k2[16];
-	int nkey = golden_claw_search(16, k1, k2);
-	assert(nkey > 0);
+    MPI_Allreduce(&nkey, &nkey_global, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        printf("Total number of keys: %d\n", nkey_global);
+    }
+
+    if (nkey_global <= 0) {
+        fprintf(stderr, "No solution has been found.\n");
+    }
 
 	/* validation */
 	for (int i = 0; i < nkey; i++) {
     	assert(f(k1[i]) == g(k2[i]));
     	assert(is_good_pair(k1[i], k2[i]));		
-	    printf("Solution found: (%" PRIx64 ", %" PRIx64 ") [checked OK]\n", k1[i], k2[i]);
+	    printf("Solution found: (%" PRIx64 ", %" PRIx64 ") [checked OK] (process #%d)\n", k1[i], k2[i], rank);
 	}
 
-    free(A);
     MPI_Finalize();
     return 0;
 }
